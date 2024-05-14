@@ -26,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import random_split
@@ -168,15 +169,17 @@ def collate_fn(batch):
 class BiLSTM(nn.Module):
     def __init__(self, embedding_dim, hidden_dim, output_dim, num_layers):
         super(BiLSTM, self).__init__()
-        self.lstm = nn.LSTM(embedding_dim, hidden_dim, num_layers=num_layers, batch_first=True, bidirectional=True)
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim, num_layers=num_layers, batch_first=True, bidirectional=True, dropout=0.5)
         self.fc = nn.Linear(hidden_dim * 2, output_dim)
+        self.dropout = nn.Dropout(0.5) # Dropout layer
 
     def forward(self, x):
         # Computing the packed sequence of embeddings
         packed_output, (hidden, cell) = self.lstm(x)
         # Concatenate the final forward and backward hidden state
         hidden = torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1)
-        out = self.fc(hidden)
+        dropped = self.dropout(hidden)
+        out = self.fc(dropped)
         return torch.sigmoid(out)
     
 
@@ -195,7 +198,7 @@ print('device:', device)
 TRAIN_BATCH_SIZE = 32
 TEST_BATCH_SIZE = 32
 VAL_BATCH_SIZE = 32
-LR = 0.0001
+LR = 0.001
 NUM_EPOCHS = 50
 
 # Hyperparameters
@@ -206,10 +209,19 @@ num_layers = 2
 
 # Initialize model, loss, and optimizer
 model = BiLSTM(embedding_dim, hidden_dim, output_dim, num_layers).to(device)
-optimizer = optim.Adam(model.parameters(), lr=LR)
+optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-5)
 loss_fn = nn.BCELoss()
 
-train_data, temp_data, train_labels, temp_labels = train_test_split(sentences, df_lemmatization['sentiment'].values, test_size=0.2, random_state=42, stratify=df_lemmatization['sentiment'].values)
+# Early Stopping Setup
+early_stopping_patience = 5
+early_stopping_counter = 0
+min_val_loss = float('inf')
+
+# Learning Rate Scheduler
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+
+# Split the data into training, validation, and test sets
+train_data, temp_data, train_labels, temp_labels = train_test_split(sentences, df['sentiment'].values, test_size=0.2, random_state=42, stratify=df['sentiment'].values)
 val_data, test_data, val_labels, test_labels = train_test_split(temp_data, temp_labels, test_size=0.5, random_state=42, stratify=temp_labels)
 
 # Create Datasets
@@ -227,7 +239,7 @@ val_loader = DataLoader(val_dataset, batch_size=VAL_BATCH_SIZE, shuffle=False,  
 test_loader = DataLoader(test_dataset, batch_size=TEST_BATCH_SIZE, shuffle=False,  collate_fn=collate_fn)
 print("Data loaders initialized.")
 
-writer = SummaryWriter('tensorboard/bilstm_50k')
+writer = SummaryWriter('tensorboard/bilstm_50k-new-50epoch')
 
 # store metrics
 train_losses, val_losses, eval_metrics = [], [], []
@@ -254,9 +266,6 @@ for epoch in range(1, NUM_EPOCHS + 1):
     val_losses.append(val_loss)
     writer.add_scalar('Validation Loss', val_loss, epoch)
     print(f'Validation Loss: {val_loss:.4f}')
-
-    writer.flush()
-
     # Evaluation metrics
     preds = torch.cat(preds)
     labels = torch.cat(labels)
@@ -264,23 +273,29 @@ for epoch in range(1, NUM_EPOCHS + 1):
     precision = precision_score(labels.cpu(), preds.cpu())
     recall = recall_score(labels.cpu(), preds.cpu())
     f1 = f1_score(labels.cpu(), preds.cpu())
-
     eval_metrics.append({
         'accuracy': accuracy,
         'precision': precision,
         'recall': recall,
         'f1': f1
     })
+    print(f'Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}')
 
+    # Adjust learning rate based on validation loss
+    print('Adjusting learning rate based on validation loss...')
+    current_lr = optimizer.param_groups[0]['lr']
+    scheduler.step(val_loss)
+    last_lr = scheduler.get_last_lr()
+    print(f'Last LR: {last_lr} | Current LR: {current_lr}')
+    
+    writer.flush()
+    
+    # Calculate epoch duration
     end_time = time.time()
     duration_seconds = int(end_time - start_time)
     hours = duration_seconds // 3600
     minutes = (duration_seconds % 3600) // 60
     seconds = duration_seconds % 60
-
-    print('Validation Evaluation Metrics')
-    print(f'Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}')
-    # print(f'Training Duration: {(end_time - start_time):.2f}s\n')
     print(f'Training Duration: {hours}h:{minutes}m:{seconds}s\n')
 
 writer.close()
